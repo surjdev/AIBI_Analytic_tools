@@ -1,0 +1,12 @@
+#Filtering out unexpressed probes
+expression_threshold = pivoted_samples_average.quantile(0.3)
+expressed_probes = pivoted_samples_average[pivoted_samples_average >= expression_threshold].index.tolist()
+print("number of probes above threshold: ", len(expressed_probes))
+
+#Redefine expression data using only the expressed probes
+exprsdata = gse.pivot_samples("VALUE").loc[expressed_probes]
+exprsdata = exprsdata.T
+#Deletes additional samples that aren't being analyzed
+exprsdata = exprsdata[exprsdata.index.isin(list_samples)]
+#Drop any probe columns where expression data is missing or negative
+exprsdata.dropna(axis = 1)
