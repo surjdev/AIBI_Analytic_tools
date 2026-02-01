@@ -1,0 +1,608 @@
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+
+BiocManager::install("GEOquery")
+
+
+BiocManager::install("Biobase")
+
+
+# --- ตรวจสอบข้อมูลเบื้องต้น ---
+
+# เช็กว่าเราได้ข้อมูลมากี่ชุด (ปกติจะได้ list ความยาว 1)
+gset <- getGEO("GSE66360", GSEMatrix = TRUE, AnnotGPL = TRUE)
+
+show(gset)
+
+
+length(gset)
+
+my_data <- gset[[1]]
+
+pData(my_data)[1:5, ]
+
+ncol(my_data)
+
+outliers <- c("GSM1620857", "GSM1620858", 
+              "GSM1620894", "GSM1620899", "GSM1620912", 
+              "GSM1620913", "GSM1620872", "GSM1620885", "GSM1620892")
+
+print(paste("จำนวนตัวอย่างก่อนลบ:", ncol(my_data)))
+samples_to_keep <- !(sampleNames(my_data) %in% outliers)
+clean_data <- my_data[, samples_to_keep]
+print(paste("จำนวนตัวอย่างหลังลบ:", ncol(clean_data)))
+
+# เรียกใช้ไลบรารี limma (เครื่องมือหลักของงานนี้)
+library(limma)
+
+# 1. ดึงเฉพาะข้อมูลตัวเลข (Expression Data) ออกมาจาก clean_data
+ex <- exprs(clean_data)
+
+# 2. เช็กว่าต้องแปลง Log2 หรือไม่? (RMA ต้องเป็น Log scale)
+# ถ้าค่าสูงสุดเกิน 50 แปลว่ายังเป็นค่าดิบอยู่ ต้องจับใส่ log2
+qx <- as.numeric(quantile(ex, c(0., 0.25, 0.5, 0.75, 0.99, 1.0), na.rm=T))
+LogC <- (qx[5] > 100) ||
+          (qx[6]-qx[1] > 50 && qx[2] > 0)
+if (LogC) { ex[which(ex <= 0)] <- NaN
+  ex <- log2(ex)
+  print("แปลงข้อมูลเป็น Log2 เรียบร้อย (RMA style)") } else {
+  print("ข้อมูลเป็น Log2 อยู่แล้ว ไม่ต้องแปลงเพิ่ม") }
+
+# 3. ปรับมาตรฐานข้อมูลระหว่างตัวอย่าง (Normalize Between Arrays)
+# [cite_start]เปเปอร์บอกให้ทำขั้นตอนนี้เพื่อเกลี่ยให้ข้อมูลเทียบกันได้แม่นยำขึ้น [cite: 87]
+ex_norm <- normalizeBetweenArrays(ex)
+
+# 4. อัปเดตข้อมูลที่ปรับแล้วกลับเข้าไปเก็บไว้
+exprs(clean_data) <- ex_norm
+
+# 5. (QC) วาดกราฟ Boxplot เพื่อดูความเรียบร้อย
+# ถ้ากราฟแท่งๆ เรียงกันสวยงาม ขีดกลางอยู่ระดับเดียวกัน แปลว่าคุณภาพผ่าน
+boxplot(ex_norm, main="After Normalization (QC)",
+        col="skyblue", outline=FALSE, las=2)
+
+# --- ขั้นตอนเตรียมแยกกลุ่ม Discovery vs Validation ---
+
+# ดูชื่อคอลัมน์ทั้งหมดว่ามีหัวข้ออะไรบ้าง
+colnames(pData(clean_data))
+
+# ลองสุ่มดูข้อมูลในคอลัมน์ที่น่าสงสัย (ปกติมักชื่อ characteristics_ch1 หรือ title)
+print("--- ตัวอย่างข้อมูลใน characteristics_ch1 ---")
+head(pData(clean_data)$characteristics_ch1, 10)
+
+print("--- ตัวอย่างข้อมูลใน source_name_ch1 ---")
+head(pData(clean_data)$source_name_ch1, 10)
+
+
+# --- แก้ไข Step 3: แยกกลุ่มและหา DEGs (ฉบับแก้ชื่อแล้ว) ---
+
+# 1. แยกกลุ่ม Discovery (เหมือนเดิม)
+discovery_idx <- grep("discovery", clean_data$"cohort:ch1", ignore.case = TRUE)
+discovery_set <- clean_data[, discovery_idx]
+print(paste("จำนวนคนในชุด Discovery:", ncol(discovery_set)))
+
+# 2. ดึงชื่อกลุ่มและทำความสะอาดชื่อ (ส่วนที่เพิ่มมาแก้ Error)
+raw_groups <- discovery_set$"disease_status:ch1"
+# ลบคำนำหน้า "disease_status: " ทิ้ง
+clean_groups <- gsub("disease_status: ", "", raw_groups)
+# ถ้ามีชื่อยาวๆ "Acute myocardial infarction" เปลี่ยนเป็น "AMI"
+clean_groups <- gsub("Acute myocardial infarction", "AMI", clean_groups, ignore.case = TRUE)
+
+# เช็กชื่อกลุ่มดู (ต้องเหลือแค่ Control กับ AMI)
+print("ชื่อกลุ่มที่แก้แล้ว:")
+table(clean_groups)
+
+# 3. สร้าง Factor และ Design Matrix
+groups <- factor(clean_groups, levels = c("Control", "AMI"))
+design <- model.matrix(~ 0 + groups)
+colnames(design) <- c("Control", "AMI")
+
+# เช็กความเข้ากันของข้อมูล (ถ้าเลขเท่ากันก็ผ่านฉลุย)
+print(paste("Design Rows:", nrow(design)))
+print(paste("Data Columns:", ncol(discovery_set)))
+
+# 4. คำนวณหา DEGs
+fit <- lmFit(discovery_set, design)
+cont.matrix <- makeContrasts(AMI - Control, levels = design)
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2)
+
+# ดึงผลลัพธ์ (Fold Change > 1, FDR < 0.05)
+degs <- topTable(fit2, adjust.method = "fdr", number = Inf, p.value = 0.05, lfc = 1)
+
+# สรุปผล
+print(paste("เจอยีนผิดปกติ (DEGs) ทั้งหมด:", nrow(degs), "ยีน"))
+head(degs)
+
+# --- โค้ดตรวจสอบชื่อกลุ่ม (Debug) ---
+
+# 1. ดูว่าคอลัมน์ disease_status:ch1 เก็บค่าอะไรไว้บ้าง (แบบดิบๆ)
+raw_groups <- discovery_set$"disease_status:ch1"
+
+print("--- ชื่อกลุ่มจริงๆ ในข้อมูล (ก่อนแก้) ---")
+table(raw_groups) # ดูซิว่ามันเขียนว่าอะไรบ้าง (เช่นมีเว้นวรรค หรือตัวพิมพ์ใหญ่/เล็ก)
+
+# 2. ลองใช้คอลัมน์สำรอง characteristics_ch1 เผื่อคอลัมน์แรกข้อมูลไม่ครบ
+# (เพราะตอนแรกคุณเคยโชว์ว่าคอลัมน์นี้มีข้อมูลชัวร์ๆ)
+raw_groups_backup <- discovery_set$characteristics_ch1
+print("--- ชื่อกลุ่มในคอลัมน์สำรอง ---")
+table(raw_groups_backup)
+
+
+
+# --- แก้ไข Step 3 (Final): แยกกลุ่มและหา DEGs ---
+
+# 1. แยกกลุ่ม Discovery (เหมือนเดิม)
+discovery_idx <- grep("discovery", clean_data$"cohort:ch1", ignore.case = TRUE)
+discovery_set <- clean_data[, discovery_idx]
+print(paste("จำนวนคนในชุด Discovery:", ncol(discovery_set)))
+
+# 2. ดึงชื่อกลุ่มและแก้ชื่อให้ถูกต้อง (แก้ตรงนี้!)
+raw_groups <- discovery_set$"disease_status:ch1"
+
+# ลบคำนำหน้า "disease_status: " ทิ้ง (ถ้ามี)
+clean_groups <- gsub("disease_status: ", "", raw_groups)
+
+# เปลี่ยน "Myocardial Infarction" ให้เป็น "AMI" (บรรทัดนี้สำคัญมาก)
+clean_groups <- gsub("Myocardial Infarction", "AMI", clean_groups, ignore.case = TRUE)
+
+# เช็กชื่อกลุ่มดูอีกที (ต้องได้ Control: 20, AMI: 21 รวมเป็น 41)
+print("ชื่อกลุ่มที่แก้แล้ว:")
+table(clean_groups)
+
+# 3. สร้าง Factor และ Design Matrix
+groups <- factor(clean_groups, levels = c("Control", "AMI"))
+design <- model.matrix(~ 0 + groups)
+colnames(design) <- c("Control", "AMI")
+
+# เช็กความเข้ากันของข้อมูล (เลข 2 ตัวนี้ต้องเท่ากันคือ 41)
+print(paste("Design Rows:", nrow(design)))
+print(paste("Data Columns:", ncol(discovery_set)))
+
+# 4. คำนวณหา DEGs
+fit <- lmFit(discovery_set, design)
+cont.matrix <- makeContrasts(AMI - Control, levels = design)
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2)
+
+# ดึงผลลัพธ์ (Fold Change > 1, FDR < 0.05)
+degs <- topTable(fit2, adjust.method = "fdr", number = Inf, p.value = 0.05, lfc = 1)
+
+# สรุปผล
+print(paste("เจอยีนผิดปกติ (DEGs) ทั้งหมด:", nrow(degs), "ยีน"))
+head(degs)
+
+# --- แก้ไขการติดตั้ง WGCNA (Force Install) ---
+
+# 1. ติดตั้งแพ็กเกจเสริมที่ WGCNA จำเป็นต้องใช้ (มักจะ Error เพราะขาดพวกนี้)
+BiocManager::install(c("GO.db", "impute", "preprocessCore"))
+
+# 2. ติดตั้ง WGCNA อีกรอบ
+BiocManager::install("WGCNA", force = TRUE)
+
+# 3. เรียกใช้งาน (สำคัญมาก! ต้องรันบรรทัดนี้แล้วไม่มี Error)
+library(WGCNA)
+
+# --- ลองรันคำสั่งเดิมอีกครั้ง ---
+allowWGCNAThreads()
+datExpr <- t(exprs(discovery_set))
+
+# เช็กข้อมูล (ถ้าผ่าน จะต้องไม่ขึ้น Error แล้ว)
+gsg <- goodSamplesGenes(datExpr, verbose = 3)
+
+if (gsg$allOK) {
+  print("✅ สำเร็จ! ข้อมูลสมบูรณ์พร้อมทำ WGCNA")
+} else {
+  print("❌ ยังมีข้อมูลบางส่วนเสียหาย ต้องซ่อมแซม")
+}
+
+
+# ถ้ามีข้อมูลไม่ดี ให้ลบทิ้ง
+if (!gsg$allOK) {
+  # ลบยีนที่เสีย
+  if (sum(!gsg$goodGenes) > 0) 
+     printFlush(paste("กำลังลบยีนที่เสีย:", paste(names(datExpr)[!gsg$goodGenes], collapse = ", ")))
+  
+  # ลบตัวอย่างที่เสีย (ถ้ามี)
+  if (sum(!gsg$goodSamples) > 0) 
+     printFlush(paste("กำลังลบตัวอย่างที่เสีย:", paste(rownames(datExpr)[!gsg$goodSamples], collapse = ", ")))
+  
+  # อัปเดตข้อมูลให้เหลือแต่ของดี
+  datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes]
+}
+
+print("✅ ซ่อมแซมข้อมูลเสร็จสิ้น พร้อมลุยต่อ!")
+
+
+# --- สร้างเครือข่าย WGCNA (ตามค่าในเปเปอร์) ---
+
+# ใช้ Power = 6 ตามที่เปเปอร์ระบุ
+power_val <- 6 
+
+# สั่งสร้าง Network แบบอัตโนมัติ (One-step construction)
+net <- blockwiseModules(datExpr, 
+                        power = power_val,
+                        TOMType = "unsigned", 
+                        minModuleSize = 50,      # เปเปอร์บอก 50
+                        mergeCutHeight = 0.5,    # เปเปอร์บอก 0.5
+                        numericLabels = TRUE, 
+                        pamRespectsDendro = FALSE,
+                        saveTOMs = FALSE,
+                        verbose = 3)
+
+# ดูผลลัพธ์ว่าเจอกี่สี (กี่ Module)
+print("ตารางจำนวนยีนในแต่ละสี (0 คือสีเทา/ยีนไร้สังกัด):")
+table(net$colors)
+
+# แปลงตัวเลขกลับเป็นชื่อสี เพื่อให้เหมือนในเปเปอร์ (เช่น turquoise, pink)
+moduleLabels <- net$colors
+moduleColors <- labels2colors(net$colors)
+
+# วาดกราฟ Dendrogram ดูเล่นๆ ว่าสวยไหม
+plotDendroAndColors(net$dendrograms[[1]], moduleColors[net$blockGenes[[1]]],
+                    "Module Colors",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05,
+                    main = "Gene Dendrogram and Module Colors")
+
+# --- 1. สร้างตาราง traits ใหม่ (แก้ Error) ---
+
+# ดึงชื่อกลุ่มคนไข้จาก discovery_set มาเช็กอีกรอบ
+raw_groups <- discovery_set$"disease_status:ch1"
+# ลบคำนำหน้าและแก้ชื่อให้เป็น AMI (เหมือนตอนทำ Step 3)
+clean_groups_for_trait <- gsub("disease_status: ", "", raw_groups)
+clean_groups_for_trait <- gsub("Myocardial Infarction", "AMI", clean_groups_for_trait, ignore.case = TRUE)
+
+# สร้างตาราง traits: ถ้าเป็น AMI ให้ค่าเป็น 1, ถ้าไม่ใช่ (Control) ให้เป็น 0
+traits <- data.frame(row.names = rownames(datExpr))
+traits$AMI_Status <- ifelse(clean_groups_for_trait == "AMI", 1, 0)
+
+print("✅ สร้างตาราง traits เสร็จแล้ว")
+head(traits) # เช็กดูว่ามีเลข 0 กับ 1 ไหม
+
+# --- 2. คำนวณหาความสัมพันธ์ (Correlation) ต่อได้เลย ---
+
+# คำนวณค่าตัวแทนของแต่ละสี
+MEs0 <- moduleEigengenes(datExpr, moduleColors)$eigengenes
+MEs <- orderMEs(MEs0)
+
+# หาความสัมพันธ์ระหว่าง "สี" กับ "โรค"
+moduleTraitCor <- cor(MEs, traits, use = "p")
+moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nrow(datExpr))
+
+# --- 3. เรียงลำดับสีที่ "ใช่" ที่สุด ---
+result_table <- data.frame(
+  Module = substring(rownames(moduleTraitCor), 3), # ตัดคำว่า ME ออก
+  Correlation = moduleTraitCor[, "AMI_Status"],
+  P_Value = moduleTraitPvalue[, "AMI_Status"]
+)
+
+# เรียงจากมากไปน้อย (Correlation เป็นบวกสูงๆ = สัมพันธ์กับโรคมาก)
+result_table <- result_table[order(-result_table$Correlation), ]
+
+print("--- 🏆 5 อันดับสีที่สัมพันธ์กับโรค AMI มากที่สุด ---")
+print(head(result_table, 5))
+
+# --- 5. หาจุดตัด (Intersection) ของยีน (ฉบับแก้) ---
+
+# 1. ดึงรายชื่อยีนจาก WGCNA (สี Yellow + Red)
+wgcna_genes <- names(datExpr)[moduleColors %in% c("yellow", "red")]
+# บรรทัดนี้ต้องมีวงเล็บปิด 3 ตัว )))
+print(paste("จำนวนยีนใน WGCNA (Yellow + Red):", length(wgcna_genes)))
+
+# 2. ดึงรายชื่อยีนจาก DEGs
+deg_genes <- rownames(degs)
+print(paste("จำนวนยีนใน DEGs:", length(deg_genes)))
+
+# 3. หาตัวที่ซ้ำกัน (Intersection)
+intersect_genes <- intersect(wgcna_genes, deg_genes)
+
+# สรุปผล
+print("------------------------------------------------")
+print(paste("🏆 จำนวนยีนที่เข้ารอบสุดท้าย (Intersection):", length(intersect_genes)))
+print("------------------------------------------------")
+
+
+# --- แปลงรหัส Probe ID เป็นชื่อยีน (Gene Symbol) ---
+
+# เราจะดึงข้อมูลจากตาราง degs เฉพาะแถวที่เป็น "ยีนผู้เข้ารอบ" (intersect_genes)
+# เลือกมาโชว์เฉพาะชื่อยีน (Gene.symbol) และคำอธิบาย (Gene.title)
+final_candidates <- degs[intersect_genes, c("Gene.symbol", "Gene.title", "logFC", "adj.P.Val")]
+
+# เรียงลำดับตามความแรง (logFC) จากมากไปน้อย จะได้เห็นตัวจี๊ดๆ ก่อน
+final_candidates <- final_candidates[order(-final_candidates$logFC), ]
+
+# โชว์ 20 อันดับแรก
+print("--- 🏆 รายชื่อยีนผู้เข้ารอบ 20 อันดับแรก ---")
+print(head(final_candidates[, c("Gene.symbol", "logFC")], 20))
+
+# --- เช็กว่าตรงกับเปเปอร์ไหม? ---
+# เปเปอร์บอกว่าเจอ Hub Genes 6 ตัวนี้:
+# LILRA1, CCL20, IL1R2, TYROBP, CXCL16, NFKBIA
+target_genes <- c("LILRA1", "CCL20", "IL1R2", "TYROBP", "CXCL16", "NFKBIA")
+
+print("--- 🔍 ตรวจสอบยีนเป้าหมายในลิสต์ของเรา ---")
+# หาว่าในลิสต์ของเรา มียีนพวกนี้ติดมาไหม
+matches <- final_candidates[final_candidates$Gene.symbol %in% target_genes, ]
+
+if (nrow(matches) > 0) {
+  print("เจอแล้ว!! 🎉 ยีนเหล่านี้อยู่ในลิสต์ของคุณ:")
+  print(matches[, c("Gene.symbol", "logFC")])
+} else {
+  print("ยังไม่เจอในรอบแรก อาจต้องเช็กการตั้งชื่อ (Symbol) อีกที")
+}
+
+
+# --- 6. เตรียมข้อมูลสำหรับ AI ---
+
+# 1. ติดตั้งแพ็กเกจ ML (ถ้ายังไม่มี)
+if (!require("glmnet")) install.packages("glmnet")
+if (!require("randomForest")) install.packages("randomForest")
+if (!require("caret")) install.packages("caret") # สำหรับ SVM
+
+library(glmnet)
+library(randomForest)
+library(caret)
+
+# 2. เตรียมตารางข้อมูล (X) และเฉลย (Y)
+# เอาเฉพาะยีนที่เข้ารอบ (Intersect Genes) มาวิเคราะห์
+x_data <- t(exprs(discovery_set)[intersect_genes, ])
+y_data <- as.factor(clean_groups) # Control vs AMI
+
+print("เตรียมข้อมูลสำหรับ AI เสร็จสิ้น...")
+
+# --- AI ตัวที่ 1: LASSO Regression ---
+print("🤖 กำลังรัน LASSO...")
+set.seed(123) # ล็อกผลให้เหมือนเดิมทุกครั้ง
+
+# แปลง Y เป็นตัวเลข (AMI=1, Control=0) สำหรับ LASSO
+y_lasso <- ifelse(y_data == "AMI", 1, 0)
+
+# สร้างโมเดล LASSO
+cv_lasso <- cv.glmnet(as.matrix(x_data), y_lasso, family = "binomial", alpha = 1)
+
+# ดูจุดที่โมเดลเลือกยีนได้ดีที่สุด (Lambda Minimum)
+best_lambda <- cv_lasso$lambda.min
+lasso_coef <- coef(cv_lasso, s = best_lambda)
+
+# ดึงชื่อยีนที่ LASSO เลือก (ค่าที่ไม่ใช่ 0)
+lasso_genes_ids <- rownames(lasso_coef)[lasso_coef[,1] != 0]
+lasso_genes_ids <- lasso_genes_ids[lasso_genes_ids != "(Intercept)"] # ตัดค่าคงที่ออก
+
+# แปลงรหัสเป็นชื่อยีน
+lasso_gene_names <- degs[lasso_genes_ids, "Gene.symbol"]
+print(paste("✅ LASSO เลือกมาได้:", length(lasso_gene_names), "ยีน"))
+print(head(lasso_gene_names))
+
+# --- AI ตัวที่ 2: Random Forest ---
+print("🌲 กำลังรัน Random Forest (อาจใช้เวลาสักครู่)...")
+set.seed(123)
+
+# สร้างโมเดล RF
+rf_model <- randomForest(x_data, y_data, ntree = 500, importance = TRUE)
+
+# ดูความสำคัญของยีน (MeanDecreaseGini)
+importance_df <- as.data.frame(importance(rf_model))
+importance_df$GeneID <- rownames(importance_df)
+
+# เรียงลำดับจากสำคัญมาก -> น้อย
+importance_df <- importance_df[order(-importance_df$MeanDecreaseAccuracy), ]
+
+# เลือก Top 30 ยีนแรก
+top_rf_ids <- head(importance_df$GeneID, 30)
+rf_gene_names <- degs[top_rf_ids, "Gene.symbol"]
+
+print(paste("✅ Random Forest Top 30 ยีนแรก:"))
+print(head(rf_gene_names))
+
+# --- สรุป: หาตัวที่ AI ทั้งสองตัวเห็นตรงกัน ---
+final_hub_candidates <- intersect(lasso_gene_names, rf_gene_names)
+
+print("----------------------------------------------------")
+print("🏆 ยีนที่ AI ทั้งสองตัวโหวตตรงกัน (Hub Genes):")
+print("----------------------------------------------------")
+print(final_hub_candidates)
+
+
+# --- 1. แก้ Error: ลงแพ็กเกจ kernlab ให้เรียบร้อยก่อน ---
+if (!require("kernlab")) install.packages("kernlab")
+library(kernlab)
+library(caret)
+library(e1071)
+
+# --- 2. รัน SVM-RFE อีกรอบ (คราวนี้ผ่านฉลุย) ---
+print("🐢 กำลังรัน SVM-RFE (รอแป๊บนึงนะครับ)...")
+set.seed(123)
+
+# กำหนด Cross-Validation 10 รอบ
+control <- rfeControl(functions = caretFuncs, method = "cv", number = 10)
+
+# สั่งรัน RFE (หาว่ายีนไหนแยกคนป่วยได้ดีสุด)
+svm_profile <- rfe(x_data, y_data,
+                   sizes = c(1:40),
+                   rfeControl = control,
+                   method = "svmRadial")
+
+# ดึงชื่อยีนที่ SVM เลือก
+svm_genes_ids <- predictors(svm_profile)
+svm_gene_names <- degs[svm_genes_ids, "Gene.symbol"]
+
+print(paste("✅ SVM-RFE เลือกมาได้:", length(svm_gene_names), "ยีน"))
+print(head(svm_gene_names))
+
+# --- 3. 🏆 ตัดสินรอบ Final (Intersect 3 AI) ---
+final_hub_genes <- intersect(lasso_gene_names, rf_gene_names)
+final_hub_genes <- intersect(final_hub_genes, svm_gene_names)
+
+print("----------------------------------------------------")
+print("🎉🎉 สรุปยีน Final Hub Genes (ที่ AI 3 ตัวเห็นตรงกัน) 🎉🎉")
+print("----------------------------------------------------")
+# ถ้าไม่เจอ (เป็น 0) ให้ลองดูเฉพาะตัวที่ Lasso กับ RF เห็นตรงกันก่อน
+if(length(final_hub_genes) == 0) {
+   print("⚠️ (AI 3 ตัวเข้มงวดไป ไม่เจอตัวซ้ำกันเป๊ะๆ)")
+   print("👉 ยีนที่แนะนำ (จาก LASSO + Random Forest):")
+   print(intersect(lasso_gene_names, rf_gene_names))
+} else {
+   print(final_hub_genes)
+}
+
+# (แถม) เช็กว่า SVM เจอยีนเป้าหมายไหม?
+target_check <- c("LILRA1", "CCL20", "IL1R2", "TYROBP", "CXCL16", "NFKBIA")
+print("--- เช็กยีนเป้าหมายใน SVM ---")
+print(intersect(svm_gene_names, target_check))
+
+# --- ดูยีนที่ติด 2 ใน 3 (Venn Diagram แบบย่อมๆ) ---
+
+# รวมรายชื่อยีนที่แต่ละ AI เลือก
+u1 <- union(lasso_gene_names, rf_gene_names)
+u2 <- union(u1, svm_gene_names)
+all_candidates <- unique(c(lasso_gene_names, rf_gene_names, svm_gene_names))
+
+# นับคะแนนโหวต (Vote Counting)
+vote_counts <- data.frame(Gene = all_candidates, Score = 0)
+
+for(g in all_candidates) {
+  score <- 0
+  if(g %in% lasso_gene_names) score <- score + 1
+  if(g %in% rf_gene_names) score <- score + 1
+  if(g %in% svm_gene_names) score <- score + 1
+  vote_counts[vote_counts$Gene == g, "Score"] <- score
+}
+
+# เรียงลำดับคนได้คะแนน 2 ขึ้นไป
+almost_winners <- vote_counts[vote_counts$Score >= 2, ]
+almost_winners <- almost_winners[order(-almost_winners$Score), ]
+
+print("--- 🥈 ยีนที่เกือบชนะ (ติด 2 ใน 3 AI) ---")
+print(almost_winners)
+
+
+# --- 7. Validation: พิสูจน์ความแม่นยำด้วย ROC Curve ---
+
+# 1. ติดตั้งแพ็กเกจ pROC (ถ้ายังไม่มี)
+if (!require("pROC")) install.packages("pROC")
+library(pROC)
+
+# 2. เตรียมข้อมูลชุด Validation (ที่เราแยกไว้แต่ยังไม่ได้ใช้)
+val_idx <- grep("validation", clean_data$"cohort:ch1", ignore.case = TRUE)
+validation_set <- clean_data[, val_idx]
+
+print(paste("จำนวนคนในชุด Validation:", ncol(validation_set)))
+
+# 3. เตรียมเฉลย (Control vs AMI) ของชุด Validation
+raw_val_groups <- validation_set$"disease_status:ch1"
+# ทำความสะอาดชื่อเหมือนเดิม
+clean_val_groups <- gsub("disease_status: ", "", raw_val_groups)
+clean_val_groups <- gsub("Myocardial Infarction", "AMI", clean_val_groups, ignore.case = TRUE)
+
+# แปลงเป็นตัวเลข (AMI=1, Control=0)
+y_val <- ifelse(clean_val_groups == "AMI", 1, 0)
+
+# 4. ดึงข้อมูลยีน CXCL16 ออกมาทดสอบ
+# หา Probe ID ของ CXCL16 (จากตาราง degs เดิม)
+target_symbol <- "CXCL16"
+target_probe <- rownames(degs)[which(degs$Gene.symbol == target_symbol)[1]]
+
+if (is.na(target_probe)) {
+  # เผื่อหาไม่เจอ ใช้รหัสตรงๆ (จากที่คุณเคยส่งมา)
+  target_probe <- "223454_at" 
+}
+
+# ดึงค่า Expression ของ CXCL16 ในชุด Validation
+x_val_gene <- exprs(validation_set)[target_probe, ]
+
+# 5. วาดกราฟ ROC และคำนวณ AUC
+roc_obj <- roc(y_val, x_val_gene, ci=TRUE)
+
+# พล็อตดกราฟ
+plot(roc_obj, 
+     main = paste("ROC Curve for", target_symbol, "(Validation Set)"),
+     col = "blue", lwd = 3, legacy.axes = TRUE)
+
+# โชว์ค่าความแม่นยำ (AUC)
+auc_value <- auc(roc_obj)
+print("------------------------------------------------")
+print(paste("🏆 ความแม่นยำ (AUC) ของ", target_symbol, "คือ:", round(auc_value, 4)))
+print("------------------------------------------------")
+
+# เกณฑ์การให้คะแนน:
+# AUC > 0.7 = ยอมรับได้
+# AUC > 0.8 = ดีมาก
+# AUC > 0.9 = ยอดเยี่ยม (ระดับ Biomarker)
+
+# --- Step 7 (Final Assignment): สร้างโมเดลทำนายและวัดผล (Accuracy/F1) ---
+
+library(caret)
+library(e1071)
+library(randomForest)
+
+# 1. เตรียมข้อมูลสำหรับ Train (ชุด Discovery) และ Test (ชุด Validation)
+# เราจะใช้เฉพาะยีน "CXCL16" ที่เราคัดมาได้ (Hub Gene)
+target_gene_symbol <- "CXCL16"
+# (ถ้าหาไม่เจอให้ใช้ ID นี้แทน: "223454_at")
+
+# หา Probe ID
+probe_id <- rownames(degs)[which(degs$Gene.symbol == target_gene_symbol)[1]]
+if(is.na(probe_id)) probe_id <- "223454_at" # Fallback
+
+# ดึงข้อมูล Train (Discovery)
+x_train <- as.numeric(exprs(discovery_set)[probe_id, ])
+y_train <- as.factor(ifelse(grepl("AMI", clean_groups, ignore.case=T), "Sick", "Healthy"))
+train_data <- data.frame(Gene = x_train, Class = y_train)
+
+# ดึงข้อมูล Test (Validation) - ข้อสอบจริง
+x_test <- as.numeric(exprs(validation_set)[probe_id, ])
+# ต้อง clean ชื่อกลุ่ม Validation ให้เหมือน Train
+raw_val_groups <- validation_set$"disease_status:ch1"
+clean_val_groups <- gsub("disease_status: ", "", raw_val_groups)
+clean_val_groups <- gsub("Myocardial Infarction", "AMI", clean_val_groups, ignore.case = TRUE)
+
+y_test <- as.factor(ifelse(clean_val_groups == "AMI", "Sick", "Healthy"))
+test_data <- data.frame(Gene = x_test, Class = y_test)
+
+# --- เริ่มรัน 3 โมเดลตามโจทย์ ---
+print("กำลังทดสอบ 3 โมเดล (SVM, Random Forest, GLM)...")
+
+# ตั้งค่าการเทรน (Cross Validation 5 รอบ)
+ctrl <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+# Model 1: SVM
+set.seed(123)
+model_svm <- train(Class ~ ., data = train_data, method = "svmRadial", 
+                   trControl = ctrl, metric = "ROC")
+pred_svm <- predict(model_svm, test_data)
+cm_svm <- confusionMatrix(pred_svm, test_data$Class, mode = "Prec_Recall")
+
+# Model 2: Random Forest
+set.seed(123)
+model_rf <- train(Class ~ ., data = train_data, method = "rf", 
+                  trControl = ctrl, metric = "ROC")
+pred_rf <- predict(model_rf, test_data)
+cm_rf <- confusionMatrix(pred_rf, test_data$Class, mode = "Prec_Recall")
+
+# Model 3: Logistic Regression (GLM)
+set.seed(123)
+model_glm <- train(Class ~ ., data = train_data, method = "glm", family = "binomial",
+                   trControl = ctrl, metric = "ROC")
+pred_glm <- predict(model_glm, test_data)
+cm_glm <- confusionMatrix(pred_glm, test_data$Class, mode = "Prec_Recall")
+
+# --- สรุปผลลัพธ์ส่งอาจารย์ (ข้อ 7) ---
+results_table <- data.frame(
+  Model = c("SVM", "Random Forest", "Logistic Regression"),
+  Accuracy = c(cm_svm$overall["Accuracy"], cm_rf$overall["Accuracy"], cm_glm$overall["Accuracy"]),
+  F1_Score = c(cm_svm$byClass["F1"], cm_rf$byClass["F1"], cm_glm$byClass["F1"]),
+  Sensitivity = c(cm_svm$byClass["Sensitivity"], cm_rf$byClass["Sensitivity"], cm_glm$byClass["Sensitivity"]),
+  Specificity = c(cm_svm$byClass["Specificity"], cm_rf$byClass["Specificity"], cm_glm$byClass["Specificity"])
+)
+
+print("-------------------------------------------------------")
+print(paste("🏆 ผลการทดสอบโมเดลโดยใช้ยีน:", target_gene_symbol))
+print("-------------------------------------------------------")
+print(results_table)
+
+# Bonus: อธิบายความสัมพันธ์
+print("--- คำตอบสำหรับ Extra Score ---")
+print(paste("Feature ที่สัมพันธ์กับผลลัพธ์คือ:", target_gene_symbol))
+print("เพราะค่า Expression ของยีนนี้ในคนป่วย (AMI) สูงกว่าคนปกติอย่างมีนัยสำคัญ")
